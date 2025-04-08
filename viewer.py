@@ -1,190 +1,212 @@
-import tkinter as tk
-from PIL import Image, ImageTk
-from threading import Thread
-from io import BytesIO
-import os
+import sys
 import zipfile
-from data import load_read_list, update_current_position, add_to_read_list
+from PyQt5.QtWidgets import QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QToolBar, QAction
+from PyQt5.QtGui import QPixmap, QKeyEvent
+from PyQt5.QtCore import Qt
+from data import load_read_list, save_read_list, add_to_read_list, update_current_position, create_cbz
+class ViewerConfig:
+    BACKGROUND_COLOR = "#2b2b2b"  
+    TEXT_COLOR = "#ffffff"        
+    MANHWA_WIDTH_THRESHOLD = 300  
+    SCROLL_INCREMENT = 50         
+    MIN_WINDOW_SIZE = 100         
+    MANHWA_AUTO_ZOOM = 5.0        
 
-class MangaViewer:
-    def __init__(self, root, cbz_filename, chapters, current_index, series_name, cookies, stdscr):
-        self.root = root
-        self.root.title(f"Manga Viewer - {os.path.basename(cbz_filename)}")
-        self.root.configure(bg="#2b2b2b")
+class MangaViewer(QMainWindow):
+    def __init__(self, cbz_filename, chapters, current_index, series_name, cookies, stdscr):
+        super().__init__()
+        self.setWindowTitle("Manga Viewer - PyQt5 Integration")
+        self.setGeometry(100, 100, 800, 600)
+
         self.chapters = chapters
         self.current_index = current_index
         self.series_name = series_name
         self.cookies = cookies
-        self.next_cbz = None
         self.stdscr = stdscr
-        self.read = False
-        self.download_thread = None
-        self.messages = [] 
-
-        self.label = tk.Label(root, bg="#2b2b2b")
-        self.label.pack()
-
-        self.page_label = tk.Label(root, text="", bg="#2b2b2b", fg="#ffffff")
-        self.page_label.pack()
-
-        self.prev_button = tk.Button(root, text="Previous", command=self.prev_page, bg="#404040", fg="#ffffff", activebackground="#505050")
-        self.prev_button.pack(side=tk.LEFT, padx=5, pady=5)
-
-        self.next_button = tk.Button(root, text="Next", command=self.next_page, bg="#404040", fg="#ffffff", activebackground="#505050")
-        self.next_button.pack(side=tk.RIGHT, padx=5, pady=5)
-
-        self.next_chapter_button = tk.Button(root, text="Next Chapter", command=self.next_chapter, bg="#404040", fg="#ffffff", activebackground="#505050")
-        self.next_chapter_button.pack(side=tk.BOTTOM, pady=5)
-
-        self.root.bind("<Left>", lambda e: self.prev_page())
-        self.root.bind("<Right>", lambda e: self.next_page())
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
+        self.cbz_filename = cbz_filename
+        self.current_page = 0
+        self.full_size_mode = False
+        self.chapter_images = []
+        self.current_image_index = 0
+        self.scroll_locked = False 
+        self.view = QGraphicsView(self)
+        self.scene = QGraphicsScene(self)
+        self.view.setScene(self.scene)
+        self.setCentralWidget(self.view)
+        self.view.setFocusPolicy(Qt.StrongFocus)
+        self._create_actions()
+        self._create_toolbar()
         self.load_chapter(cbz_filename)
 
-        if self.current_index + 1 < len(self.chapters):
-            self.start_next_download()
+        self.view.setFocus()
+        self.view.setStyleSheet(f"background-color: {ViewerConfig.BACKGROUND_COLOR};")
 
-    def load_chapter(self, cbz_filename):
-        """Load images and update UI for a given chapter."""
-        self.images = []
+        self.view.verticalScrollBar().valueChanged.connect(self.check_scroll_position)
+    def check_scroll_position(self):
+        vertical_scroll_bar = self.view.verticalScrollBar()
+        max_value = vertical_scroll_bar.maximum()
+        current_value = vertical_scroll_bar.value()
+        threshold = max_value - 10
+
+        if current_value >= threshold and not self.scroll_locked:
+            self.scroll_locked = True
+            self.next_page()
+
+    def _create_actions(self):
+        self.toggle_action = QAction("Toggle Full-Size", self)
+        self.toggle_action.triggered.connect(self.toggle_full_size)
+
+    def _create_toolbar(self):
+        toolbar = QToolBar("Main Toolbar")
+        self.addToolBar(toolbar)
+        toolbar.addAction(self.toggle_action)
+
+    def load_chapter(self, chapter_info, append=False):
+        """Load chapter images and optionally append to the current scene."""
+        if isinstance(chapter_info, dict):
+            cbz_filename = chapter_info.get("cbz_filename")
+        else:
+            cbz_filename = chapter_info
+
+        if cbz_filename is None:
+            print("Error: Cannot load chapter because cbz_filename is None.")
+            return
+
         try:
-            with zipfile.ZipFile(cbz_filename, 'r') as cbz:
-                for file_info in sorted(cbz.infolist(), key=lambda x: x.filename):
-                    with cbz.open(file_info) as file:
-                        img = Image.open(BytesIO(file.read()))
-                        img.thumbnail((800, 1200), Image.Resampling.LANCZOS)
-                        self.images.append(ImageTk.PhotoImage(img))
-        except (zipfile.BadZipFile, IOError) as e:
-            self.messages.append(f"Error opening {cbz_filename}: {e}")
+            with zipfile.ZipFile(cbz_filename, 'r') as zf:
+                images = sorted(
+                    [f for f in zf.namelist() if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
+                )
 
-        if not self.images:
-            self.messages.append(f"No valid images in {cbz_filename}. Re-downloading...")
-            os.remove(cbz_filename)
-            from network import process_chapter
-            new_cbz, message = process_chapter(self.chapters[self.current_index], self.series_name, self.cookies, self.stdscr)
-            self.messages.append(message)
-            if new_cbz and os.path.getsize(new_cbz) > 1024:
-                with zipfile.ZipFile(new_cbz, 'r') as cbz:
-                    for file_info in sorted(cbz.infolist(), key=lambda x: x.filename):
-                        with cbz.open(file_info) as file:
-                            img = Image.open(BytesIO(file.read()))
-                            img.thumbnail((800, 1200), Image.Resampling.LANCZOS)
-                            self.images.append(ImageTk.PhotoImage(img))
-            else:
-                self.messages.append("Failed to re-download a valid chapter. Closing viewer.")
-                self.root.destroy()
-                return
+                if not append:
+                    self.scene.clear()
+                    self.current_image_index = 0
+                else:
+                    self.current_image_index = 0 
 
-        self.current_page = 0
-        self.total_pages = len(self.images)
+                self.chapter_images = images
+                self.cbz_file = cbz_filename
+                self.display_image_from_cbz(append=append)
 
-        read_list = load_read_list()
-        if self.series_name in read_list:
-            current_data = read_list[self.series_name].get("current", {})
-            if current_data and current_data.get("chapter") == self.chapters[self.current_index]["number"]:
-                last_page = int(current_data.get("page", "0")) - 1
-                if 0 <= last_page < self.total_pages:
-                    self.current_page = last_page
-
-        self.root.title(f"Manga Viewer - {os.path.basename(cbz_filename)}")
-        self.label.config(image=self.images[self.current_page])
-        self.update_page()
-
-    def start_next_download(self):
-        if self.current_index + 1 < len(self.chapters):
-            next_chapter = self.chapters[self.current_index + 1]
-            next_cbz = f"{self.series_name}_Chapter_{next_chapter['number']}.cbz"
-            if not os.path.exists(next_cbz) or os.path.getsize(next_cbz) <= 1024:
-                self.messages.append(f"Starting background download for {next_chapter['text']}...")
-                self.download_thread = Thread(target=self.download_next)
-                self.download_thread.start()
-
-    def download_next(self):
-        from network import process_chapter
-        try:
-            next_chapter = self.chapters[self.current_index + 1]
-            self.next_cbz, message = process_chapter(next_chapter, self.series_name, self.cookies, self.stdscr)
-            self.messages.append(f"{message}\nDownload complete.")
         except Exception as e:
-            self.messages.append(f"Background download failed: {str(e)}")
+            print(f"Failed to load chapter: {e}")
 
-    def update_page(self):
-        self.page_label.config(text=f"Page {self.current_page + 1} of {self.total_pages}")
-        self.prev_button.config(state=tk.NORMAL if self.current_page > 0 or self.current_index > 0 else tk.DISABLED)
-        self.next_button.config(state=tk.NORMAL if self.current_page < self.total_pages - 1 or self.current_index + 1 < len(self.chapters) else tk.DISABLED)
-        self.next_chapter_button.config(state=tk.NORMAL if self.current_index + 1 < len(self.chapters) else tk.DISABLED)
-        self.update_current()
+    def display_image_from_cbz(self, append=False):
+        if not self.chapter_images:
+            print("No images found in chapter.")
+            return
 
-    def update_current(self):
-        chapter_number = self.chapters[self.current_index]['number']
-        update_current_position(self.series_name, chapter_number, self.current_page + 1)
+        try:
+            with zipfile.ZipFile(self.cbz_file, 'r') as zf:
+                while self.current_image_index < len(self.chapter_images):
+                    image_name = self.chapter_images[self.current_image_index]
+                    with zf.open(image_name) as file:
+                        image_data = file.read()
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(image_data)
+                    y_offset = self.scene.itemsBoundingRect().bottom() if self.scene.items() else 0
+                    item = QGraphicsPixmapItem(pixmap)
+                    item.setPos(0, y_offset)
+                    self.scene.addItem(item)
 
-    def mark_as_read(self):
-        if not self.read and self.current_page == self.total_pages - 1:
-            chapter_number = self.chapters[self.current_index]['number']
-            add_to_read_list(self.series_name, chapter_number)
-            self.messages.append(f"Marked {self.series_name} Chapter {chapter_number} as read.")
-            self.read = True
+                    self.current_image_index += 1
 
-    def prev_page(self):
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.label.config(image=self.images[self.current_page])
-            self.update_page()
-        elif self.current_index > 0:
-            self.current_index -= 1
-            prev_cbz = f"{self.series_name}_Chapter_{self.chapters[self.current_index]['number']}.cbz"
-            if os.path.exists(prev_cbz):
-                self.load_chapter(prev_cbz)
-            else:
-                self.messages.append(f"Previous chapter {prev_cbz} not found.")
+                    if not append:
+                        break 
+
+            self.scroll_locked = False
+
+        except Exception as e:
+            print(f"Error displaying image: {e}")
+
+    def load_cbz_image(self, filename):
+        """Extract and load the first image from a CBZ file."""
+        try:
+            if not filename or isinstance(filename, dict):
+                raise ValueError("Invalid file type: Expected a file path, got None or dict.")
+            
+            with zipfile.ZipFile(filename, 'r') as zf:
+                image_files = [f for f in zf.namelist() if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
+                if not image_files:
+                    return None
+                image_files.sort()
+                with zf.open(image_files[0]) as file:
+                    data = file.read()
+                    return data
+        except Exception as e:
+            print(f"Error reading CBZ file: {e}")
+            return None
+
+    def fitInView(self):
+        """Fit the image into the window."""
+        rect = self.pixmap_item.boundingRect()
+        self.view.fitInView(rect, Qt.KeepAspectRatio)
+
+    def toggle_full_size(self):
+        """Toggle full-size or fit-to-window mode."""
+        self.full_size_mode = not self.full_size_mode
+        if self.full_size_mode:
+            self.view.resetTransform()
+            self.view.setDragMode(QGraphicsView.ScrollHandDrag)
+        else:
+            self.fitInView()
+
+    def keyPressEvent(self, event):
+        """Handle key press events for navigation."""
+        if event.key() == Qt.Key_Left:
+            self.prev_page()
+        elif event.key() == Qt.Key_Right:
+            self.next_page()
+        elif event.key() == Qt.Key_Up:
+            self.scroll_up()
+        elif event.key() == Qt.Key_Down:
+            self.scroll_down()
+        else:
+            super().keyPressEvent(event)
 
     def next_page(self):
-        if self.current_page < self.total_pages - 1:
-            self.current_page += 1
-            self.label.config(image=self.images[self.current_page])
-            self.update_page()
-            self.mark_as_read()
-        elif self.current_index + 1 < len(self.chapters):
-            self.mark_as_read()
-            self.current_index += 1
-            next_cbz = f"{self.series_name}_Chapter_{self.chapters[self.current_index]['number']}.cbz"
-            if self.download_thread and self.download_thread.is_alive():
-                self.root.title("Manga Viewer - Downloading next chapter...")
-                self.download_thread.join()
-            if os.path.exists(next_cbz) and os.path.getsize(next_cbz) > 1024:
-                self.load_chapter(next_cbz)
-                if self.current_index + 1 < len(self.chapters):
-                    self.start_next_download()
-            else:
-                self.messages.append("The next chapter is not yet downloaded or is invalid. Please wait and try again.")
-                self.current_index -= 1 
-
-    def next_chapter(self):
-        if self.current_index + 1 >= len(self.chapters):
-            self.messages.append("You have reached the end of the series.")
-            return
-        self.mark_as_read()
-        self.current_index += 1
-        next_cbz = f"{self.series_name}_Chapter_{self.chapters[self.current_index]['number']}.cbz"
-        if self.download_thread and self.download_thread.is_alive():
-            self.root.title("Manga Viewer - Downloading next chapter...")
-            self.download_thread.join()
-        if os.path.exists(next_cbz) and os.path.getsize(next_cbz) > 1024:
-            self.load_chapter(next_cbz)
-            if self.current_index + 1 < len(self.chapters):
-                self.start_next_download()
+        if self.current_image_index < len(self.chapter_images):
+            self.view.verticalScrollBar().valueChanged.disconnect(self.check_scroll_position)
+            self.display_image_from_cbz()  
+            self.view.verticalScrollBar().valueChanged.connect(self.check_scroll_position)
+            current_chapter = self.chapters[self.current_index]["number"]
+            new_page = self.current_image_index + 1  
+            update_current_position(self.series_name, current_chapter, new_page)
         else:
-            self.messages.append("Next chapter not ready or invalid. Please try again later.")
-            self.current_index -= 1  
+            if self.current_index < len(self.chapters) - 1:
+                current_chapter = self.chapters[self.current_index]["number"]
+                add_to_read_list(self.series_name, current_chapter)
+                self.current_index += 1
+                next_chapter = self.chapters[self.current_index]
+                self.load_chapter(next_chapter, append=True)
+                update_current_position(self.series_name, next_chapter["number"], 1)
+            else:
+                print("No more chapters available.")
 
-    def on_close(self):
-        if self.current_page == self.total_pages - 1:
-            self.mark_as_read()
-        self.update_current()
-        self.root.destroy()
 
-    def get_messages(self):
-        """Return stored messages for display later."""
-        return self.messages
+
+    def prev_page(self):
+        if self.current_image_index > 0:
+            self.view.verticalScrollBar().valueChanged.disconnect(self.check_scroll_position)
+            self.current_image_index -= 1
+            self.display_image_from_cbz()
+            self.view.verticalScrollBar().valueChanged.connect(self.check_scroll_position)
+            current_chapter = self.chapters[self.current_index]["number"]
+            new_page = self.current_image_index + 1  
+            update_current_position(self.series_name, current_chapter, new_page)
+        else:
+            if self.current_index > 0:
+                self.current_index -= 1
+                prev_chapter = self.chapters[self.current_index]
+                self.load_chapter(prev_chapter) 
+                update_current_position(self.series_name, prev_chapter["number"], 1)
+            else:
+                print("No previous chapters available.")
+
+    def scroll_up(self):
+        """Scroll up the current page."""
+        self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().value() - ViewerConfig.SCROLL_INCREMENT)
+
+    def scroll_down(self):
+        """Scroll down the current page."""
+        self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().value() + ViewerConfig.SCROLL_INCREMENT)

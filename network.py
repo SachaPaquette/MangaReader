@@ -8,33 +8,51 @@ from data import load_read_list, create_cbz
 from utils import clean_filename, top_left_menu, get_root
 from viewer import MangaViewer
 import curses
-SESSION = requests.Session()
 
-def get_image_urls(chapter_url, cookies):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+class NetworkConfig:
+    BASE_URL = "https://www.mangaread.org/manga/"
+    SEARCH_SUFFIX = "?s="
+    POST_TYPE_SUFFIX = "&post_type=wp-manga"
+    DEFAULT_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
     }
-    response = SESSION.get(chapter_url, headers=headers, cookies=cookies)
-    if response.status_code != 200:
-        return [], f"Failed to retrieve chapter page. Status code: {response.status_code}"
-    soup = BeautifulSoup(response.text, "html.parser")
-    image_tags = soup.find_all("img", class_="wp-manga-chapter-img")
-    image_urls = [img["src"] for img in image_tags if "src" in img.attrs]
-    return image_urls, None
-
-def download_images(image_urls, cookies, stdscr):
-    headers = {
+    IMAGE_HEADERS = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0',
         'Accept': 'image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5',
         'Accept-Language': 'en-CA,en-US;q=0.7,en;q=0.3',
         'Accept-Encoding': 'gzip, deflate, br, zstd',
     }
+    MAX_WORKERS = 5
+    MIN_FILE_SIZE = 1024
+
+CONFIG = NetworkConfig()
+SESSION = requests.Session()
+
+def get_image_urls(chapter_url, cookies, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            response = SESSION.get(chapter_url, headers=CONFIG.DEFAULT_HEADERS, cookies=cookies, timeout=10)
+            response.raise_for_status() 
+            soup = BeautifulSoup(response.text, "html.parser")
+            image_tags = soup.find_all("img", class_="wp-manga-chapter-img")
+            image_urls = [img["src"] for img in image_tags if "src" in img.attrs]
+            return image_urls, None
+        except requests.RequestException as e:
+            error_msg = f"Attempt {attempt + 1}/{retries} failed: {str(e)}"
+            if attempt + 1 == retries:
+                return [], f"Failed to retrieve chapter page after {retries} attempts: {error_msg}"
+            time.sleep(delay)
+
+def download_images(image_urls, cookies, stdscr):
     image_data = []
     messages = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_url = {
-            executor.submit(SESSION.get, url, headers=headers, cookies=cookies, stream=True): (idx, url)
+            executor.submit(SESSION.get, url, headers=CONFIG.IMAGE_HEADERS, cookies=cookies, stream=True): (idx, url)
             for idx, url in enumerate(image_urls)
         }
         for future in concurrent.futures.as_completed(future_to_url):
@@ -84,8 +102,7 @@ def process_chapter(chapter, series_name, cookies, stdscr):
         if file_size <= 1024:
             os.remove(cbz_filename)
             return None, f"File {cbz_filename} too small ({file_size} bytes), likely corrupt."
-        short_messages = [msg[:100] for msg in download_messages]
-        return cbz_filename, f"{message}\nFound {len(image_urls)} images\n" + "\n".join(short_messages) + f"\n{cbz_message}"
+        return cbz_filename, ""
     else:
         return None, "No images found."
 
@@ -97,11 +114,15 @@ def search_manga(stdscr):
     manga_name = stdscr.getstr(1, 0, 50).decode('utf-8').strip()
     curses.noecho()
 
-    url = f"https://www.mangaread.org/manga/?s={manga_name.replace(' ', '+')}&post_type=wp-manga"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    response = SESSION.get(url, headers=headers)
+    if not manga_name:
+        stdscr.addstr(2, 0, "Manga name cannot be empty.")
+        stdscr.refresh()
+        stdscr.getch()
+        return None, None, None, None
+
+    url = f"{CONFIG.BASE_URL}{CONFIG.SEARCH_SUFFIX}{'+'.join(manga_name.split())}{CONFIG.POST_TYPE_SUFFIX}"
+
+    response = SESSION.get(url, headers=CONFIG.DEFAULT_HEADERS)
     if response.status_code != 200:
         stdscr.addstr(2, 0, f"Failed to retrieve data. Status code: {response.status_code}")
         stdscr.refresh()
@@ -121,16 +142,21 @@ def search_manga(stdscr):
     manga_data = []
     manga_options = []
     for index, manga in enumerate(manga_list):
-        title_tag = manga.find("h3", class_="h4").find("a")
+        h3_tag = manga.find("h3", class_="h4")
+        title_tag = h3_tag.find("a") if h3_tag else None
         title = title_tag.text.strip() if title_tag else "Unknown Title"
         manga_url = title_tag["href"] if title_tag else "No URL"
-        status_tag = manga.find("div", class_="post-content_item mg_status").find("div", class_="summary-content")
+        status_div = manga.find("div", class_="post-content_item mg_status")
+        status_tag = status_div.find("div", class_="summary-content") if status_div else None
         status = status_tag.text.strip() if status_tag else "Unknown Status"
-        latest_chapter_tag = manga.find("div", class_="meta-item latest-chap").find("span", class_="font-meta chapter").find("a")
+        latest_div = manga.find("div", class_="meta-item latest-chap")
+        chapter_span = latest_div.find("span", class_="font-meta chapter") if latest_div else None
+        latest_chapter_tag = chapter_span.find("a") if chapter_span else None
         latest_chapter_text = latest_chapter_tag.text.strip() if latest_chapter_tag else "No Chapter"
         latest_chapter_match = re.search(r'Chapter (\d+)', latest_chapter_text)
         latest_chapter_number = latest_chapter_match.group(1) if latest_chapter_match else "Unknown"
-        update_time_tag = manga.find("div", class_="meta-item post-on").find("span", class_="font-meta")
+        update_div = manga.find("div", class_="meta-item post-on")
+        update_time_tag = update_div.find("span", class_="font-meta") if update_div else None
         update_time = update_time_tag.text.strip() if update_time_tag else "Unknown Date"
 
         manga_data.append({
@@ -160,7 +186,7 @@ def search_manga(stdscr):
     stdscr.refresh()
     time.sleep(2)
 
-    response = SESSION.get(chosen_manga["url"], headers=headers)
+    response = SESSION.get(chosen_manga["url"], headers=CONFIG.DEFAULT_HEADERS)
     if response.status_code != 200:
         stdscr.addstr(4, 0, f"Failed to retrieve manga page. Status code: {response.status_code}")
         stdscr.refresh()
@@ -182,7 +208,7 @@ def search_manga(stdscr):
         chapter_url = tag["href"]
         chapter_match = re.search(r'chapter-(\d+)', chapter_url)
         chapter_number = chapter_match.group(1) if chapter_match else "Unknown"
-        chapters.append({"text": chapter_text, "url": chapter_url, "number": chapter_number})
+        chapters.append({"text": chapter_text, "url": chapter_url, "number": chapter_number, "cbz_filename": f"{clean_filename(chosen_manga['title'])}_Chapter_{chapter_number}.cbz"})
         chapter_options.append(f"{chapter_text}")
 
     chapters.sort(key=lambda x: int(x["number"]) if x["number"] != "Unknown" else 0)
@@ -243,11 +269,9 @@ def continue_reading(stdscr):
     stdscr.refresh()
     time.sleep(1)
 
-    url = f"https://www.mangaread.org/manga/?s={series_name.replace('_', '+')}&post_type=wp-manga"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    response = requests.get(url, headers=headers)
+    url = f"{CONFIG.BASE_URL}{CONFIG.SEARCH_SUFFIX}{series_name.replace('_', '+')}{CONFIG.POST_TYPE_SUFFIX}"
+
+    response = requests.get(url, headers=CONFIG.DEFAULT_HEADERS)
     if response.status_code != 200:
         stdscr.addstr(1, 0, f"Failed to retrieve manga data. Status code: {response.status_code}")
         stdscr.refresh()
@@ -262,8 +286,17 @@ def continue_reading(stdscr):
         stdscr.getch()
         return
 
-    manga_url = manga_list[0].find("h3", class_="h4").find("a")["href"]
-    response = requests.get(manga_url, headers=headers)
+    first_manga = manga_list[0]
+    h3_tag = first_manga.find("h3", class_="h4")
+    manga_url_tag = h3_tag.find("a") if h3_tag else None
+    if not manga_url_tag:
+        stdscr.addstr(1, 0, "Failed to find manga URL in search results.")
+        stdscr.refresh()
+        stdscr.getch()
+        return
+    manga_url = manga_url_tag["href"]
+
+    response = requests.get(manga_url, headers=CONFIG.DEFAULT_HEADERS)
     if response.status_code != 200:
         stdscr.addstr(1, 0, f"Failed to retrieve manga page. Status code: {response.status_code}")
         stdscr.refresh()
@@ -284,8 +317,9 @@ def continue_reading(stdscr):
         chapter_url = tag["href"]
         chapter_match = re.search(r'chapter-(\d+)', chapter_url)
         chapter_number_from_url = chapter_match.group(1) if chapter_match else "Unknown"
-        chapters.append({"text": chapter_text, "url": chapter_url, "number": chapter_number_from_url})
-
+        chapters.append({"text": chapter_text, "url": chapter_url, "number": chapter_number_from_url, "cbz_filename": f"{series_name}_Chapter_{chapter_number_from_url}.cbz"})
+    for key, value in chapters:
+        print(f"{key}: {value}")
     chapters.sort(key=lambda x: int(x["number"]) if x["number"] != "Unknown" else 0)
 
     current_index = next((i for i, ch in enumerate(chapters) if ch["number"] == chapter_number), 0)
@@ -295,7 +329,6 @@ def continue_reading(stdscr):
     current_cbz, message = process_chapter(current_chapter, series_name, response.cookies, stdscr)
     stdscr.addstr(0, 0, message)
     stdscr.refresh()
-    time.sleep(2)
 
     if current_cbz:
         root = get_root()
